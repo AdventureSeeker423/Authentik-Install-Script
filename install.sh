@@ -31,27 +31,6 @@ need_root() {
   fi
 }
 
-# Preflight: fail fast on LXC where Docker-in-LXC commonly cannot work without host changes
-preflight_environment() {
-  local virt
-  virt="$(systemd-detect-virt 2>/dev/null || true)"
-
-  if [[ "$virt" == "lxc" ]]; then
-    log "Detected LXC environment."
-    cat >&2 <<'MSG'
-This installer uses Docker containers. Docker inside an *unprivileged* LXC often cannot start containers
-because the host blocks access to kernel sysctls (/proc/sys/*) and other required features.
-
-To run this installer reliably, use:
-  - a VM, bare metal, or
-  - a *privileged* LXC with nesting enabled (host-side setting).
-
-There is no safe way for an install script to bypass these host restrictions automatically.
-MSG
-    exit 2
-  fi
-}
-
 rand_b64() {
   # URL-safe-ish base64 (no / + =), good for secrets/tokens
   local n="${1:-48}"
@@ -152,7 +131,7 @@ setup_compose() {
   POSTGRES_PASSWORD="$(rand_pw 32)"
   AUTHENTIK_SECRET_KEY="$(rand_b64 64)"
 
-  # Bootstrap admin (akadmin) password & API token
+  # Bootstrap admin (akadmin) password & API token (documented bootstrap env vars). :contentReference[oaicite:2]{index=2}
   BOOTSTRAP_PASSWORD="$(rand_pw 20)"
   BOOTSTRAP_TOKEN="$(rand_b64 48)"
   BOOTSTRAP_EMAIL="${BOOTSTRAP_EMAIL:-root@example.com}"
@@ -256,6 +235,25 @@ services:
         condition: service_started
 EOF
 
+  preflight_environment() {
+  local virt
+  virt="$(systemd-detect-virt || true)"
+
+  if [[ "$virt" == "lxc" ]]; then
+    log "Detected LXC environment."
+    cat >&2 <<'MSG'
+This installer uses Docker containers. Docker inside an *unprivileged* LXC often cannot start containers
+because the host blocks access to kernel sysctls (/proc/sys/*) and other required features.
+
+To run this installer reliably, use:
+  - a VM, bare metal, or
+  - a *privileged* LXC with nesting enabled (host-side setting).
+
+There is no safe way for an install script to bypass these host restrictions automatically.
+MSG
+    exit 2
+  fi
+}
   log "Starting authentik stack with docker compose..."
   docker compose up -d
 
@@ -316,20 +314,25 @@ class AK:
         return f"{self.base}{path}"
 
     def get(self, path: str, **kw):
-        return self.s.get(self._url(path), timeout=30, **kw)
+        r = self.s.get(self._url(path), timeout=30, **kw)
+        return r
 
     def post(self, path: str, payload: dict, **kw):
-        return self.s.post(self._url(path), data=json.dumps(payload), timeout=30, **kw)
+        r = self.s.post(self._url(path), data=json.dumps(payload), timeout=30, **kw)
+        return r
 
     def patch(self, path: str, payload: dict, **kw):
-        return self.s.patch(self._url(path), data=json.dumps(payload), timeout=30, **kw)
+        r = self.s.patch(self._url(path), data=json.dumps(payload), timeout=30, **kw)
+        return r
 
     def put(self, path: str, payload: dict, **kw):
-        return self.s.put(self._url(path), data=json.dumps(payload), timeout=30, **kw)
+        r = self.s.put(self._url(path), data=json.dumps(payload), timeout=30, **kw)
+        return r
 
 def must_ok(r: requests.Response, what: str):
-    if 200 <= r.status_code < 300:
+    if r.status_code >= 200 and r.status_code < 300:
         return
+    # Log rich error for debugging
     try:
         body = r.json()
     except Exception:
@@ -356,6 +359,20 @@ def find_by_slug(ak: AK, list_path: str, slug: str):
             return obj
     return None
 
+def create_or_get(ak: AK, list_path: str, payload: dict, key="name", finder=find_by_name):
+    name = payload.get(key)
+    if not name:
+        raise ValueError(f"payload missing {key}: {payload}")
+    existing = finder(ak, list_path, name)
+    if existing:
+        log(f"Exists: {list_path} {name}")
+        return existing
+    r = ak.post(list_path, payload)
+    must_ok(r, f"create {list_path} {name}")
+    obj = r.json()
+    log(f"Created: {list_path} {name}")
+    return obj
+
 def main():
     http_port = os.environ["AUTH_HTTP_PORT"]
     token = os.environ["AUTH_BOOTSTRAP_TOKEN"]
@@ -368,31 +385,32 @@ def main():
     base = f"http://127.0.0.1:{http_port}/api/v3"
     ak = AK(base=base, token=token)
 
+    # Sanity check
     r = ak.get("/root/config/")
     must_ok(r, "root/config")
     log("Authenticated to authentik API using bootstrap token.")
 
     # --- Groups ---
-    global_admin = find_by_name(ak, "/core/groups/", "authentik-GlobalAdmin")
-    if not global_admin:
-        r = ak.post("/core/groups/", {"name": "authentik-GlobalAdmin"})
-        must_ok(r, "create group authentik-GlobalAdmin")
-        global_admin = r.json()
-        log("Created group authentik-GlobalAdmin")
-    else:
-        log("Group exists: authentik-GlobalAdmin")
+    global_admin = create_or_get(
+        ak, "/core/groups/",
+        {"name": "authentik-GlobalAdmin"},
+    )
 
+    # Fetch authentik Admins group (created by bootstrap blueprint)
     admins = find_by_name(ak, "/core/groups/", "authentik Admins")
     if not admins:
-        r = ak.post("/core/groups/", {"name": "authentik Admins", "is_superuser": True})
-        must_ok(r, "create group authentik Admins")
-        admins = r.json()
-        log("Created group authentik Admins")
-    else:
-        log("Group exists: authentik Admins")
+        log("authentik Admins group not found, creating it (should normally exist).")
+        admins = create_or_get(ak, "/core/groups/", {"name": "authentik Admins", "is_superuser": True})
 
     # --- Users ---
-    # adm_ldapservice
+    # adm_ldapservice (service account style path)
+    # Prefer the service_account endpoint if available
+    r = ak.get("/core/users/paths/")
+    if r.status_code == 200:
+        # optional: paths exist on some versions, but not required
+        pass
+
+    # Check if user exists
     r = ak.get("/core/users/", params={"username": "adm_ldapservice"})
     must_ok(r, "list users")
     results = r.json().get("results", [])
@@ -400,29 +418,37 @@ def main():
         ldap_user = results[0]
         log("User exists: adm_ldapservice")
     else:
-        r = ak.post("/core/users/", {
-            "username": "adm_ldapservice",
-            "name": "adm_ldapservice",
-            "is_active": True,
-            "path": "service_accounts",
-        })
-        must_ok(r, "create user adm_ldapservice")
-        ldap_user = r.json()
-        log("Created user adm_ldapservice")
+        # Use normal create; path is often a string like "service_accounts"
+        ldap_user = create_or_get(
+            ak, "/core/users/",
+            {
+                "username": "adm_ldapservice",
+                "name": "adm_ldapservice",
+                "is_active": True,
+                "path": "service_accounts",
+            },
+            key="username",
+            finder=lambda ak2, p, u: (results[0] if results else None),
+        )
 
+    # Set password
     uid = ldap_user.get("pk") or ldap_user.get("id")
+    if uid is None:
+        raise RuntimeError(f"Cannot find user id for adm_ldapservice: {ldap_user}")
     r = ak.post(f"/core/users/{uid}/set_password/", {"password": ldap_pw})
     must_ok(r, "set_password adm_ldapservice")
     log("Set password for adm_ldapservice")
 
-    # Add to authentik Admins (bootstrap permission set)
+    # NOTE: Fine-grained provider/directory permissions are RBAC-heavy.
+    # As a practical bootstrap, put it in authentik Admins so it can search/view LDAP directory/provider.
     r = ak.post(f"/core/groups/{admins['pk']}/add_user/", {"pk": uid})
-    if r.status_code not in (200, 204):
+    if r.status_code not in (204, 200):
         log(f"WARNING: add_user adm_ldapservice to authentik Admins failed: {r.status_code} {r.text}")
     else:
-        log("Added adm_ldapservice to authentik Admins")
+        log("Added adm_ldapservice to authentik Admins (bootstrap permission set).")
 
-    # --- Password policy ---
+    # --- Password policy (12 chars, upper/lower/number/symbol) ---
+    # Endpoint: /policies/password/
     policy_name = "default-password-change-password-policy"
     existing_policy = find_by_name(ak, "/policies/password/", policy_name)
     policy_payload = {
@@ -451,6 +477,9 @@ def main():
             log("Created password policy.")
 
     # --- Brand domain ---
+    # /core/brands/
+    # Use host part if a full URL is provided
+    brand_domain = ""
     if auth_domain:
         u = urlparse(auth_domain if "://" in auth_domain else f"https://{auth_domain}")
         brand_domain = u.netloc or auth_domain
@@ -474,11 +503,270 @@ def main():
         else:
             log("Created brand.")
 
-    # --- Minimal final outputs ---
+    # --- LDAP authentication flow + stages ---
+    # flows: /flows/instances/
+    flow = find_by_slug(ak, "/flows/instances/", "ldap-authentication-flow")
+    if not flow:
+        r = ak.post("/flows/instances/", {
+            "name": "ldap-authentication-flow",
+            "title": "LDAP Authentication Flow",
+            "slug": "ldap-authentication-flow",
+            "designation": "authentication",
+            "compatibility_mode": True,
+        })
+        if r.status_code >= 400:
+            log(f"WARNING: create flow failed: {r.status_code} {r.text}")
+            flow = None
+        else:
+            flow = r.json()
+            log("Created flow ldap-authentication-flow")
+    else:
+        log("Flow exists: ldap-authentication-flow")
+
+    # Stages: identification, password, user_login
+    ident_stage = find_by_name(ak, "/stages/identification/", "ldap-identification-stage")
+    if not ident_stage:
+        r = ak.post("/stages/identification/", {
+            "name": "ldap-identification-stage",
+            "user_fields": ["username"],
+            "password_fields": False,
+            "show_matched_user": False,
+        })
+        if r.status_code >= 400:
+            log(f"WARNING: create identification stage failed: {r.status_code} {r.text}")
+        else:
+            ident_stage = r.json()
+            log("Created identification stage.")
+    else:
+        log("Identification stage exists.")
+
+    pwd_stage = find_by_name(ak, "/stages/password/", "ldap-authentication-password")
+    if not pwd_stage:
+        r = ak.post("/stages/password/", {
+            "name": "ldap-authentication-password",
+            "backends": ["authentik.core.auth.InbuiltBackend"],
+        })
+        if r.status_code >= 400:
+            log(f"WARNING: create password stage failed: {r.status_code} {r.text}")
+        else:
+            pwd_stage = r.json()
+            log("Created password stage.")
+    else:
+        log("Password stage exists.")
+
+    login_stage = find_by_name(ak, "/stages/user_login/", "ldap-authentication-login")
+    if not login_stage:
+        r = ak.post("/stages/user_login/", {"name": "ldap-authentication-login"})
+        if r.status_code >= 400:
+            log(f"WARNING: create user_login stage failed: {r.status_code} {r.text}")
+        else:
+            login_stage = r.json()
+            log("Created user_login stage.")
+    else:
+        log("User_login stage exists.")
+
+    # Bind stages to flow (order: ident -> password -> login)
+    if flow and ident_stage and pwd_stage and login_stage:
+        fid = flow.get("pk") or flow.get("id")
+        def bind(stage_obj, order):
+            sid = stage_obj.get("pk") or stage_obj.get("id")
+            # check existing bindings
+            r = ak.get("/flows/bindings/", params={"target": fid})
+            if r.status_code == 200:
+                existing = r.json().get("results", [])
+                for b in existing:
+                    if (b.get("stage") == sid) and (b.get("target") == fid):
+                        return
+            payload = {
+                "target": fid,
+                "stage": sid,
+                "order": order,
+                "evaluate_on_plan": True,
+                "re_evaluate_policies": True,
+            }
+            r = ak.post("/flows/bindings/", payload)
+            if r.status_code >= 400:
+                log(f"WARNING: bind stage order={order} failed: {r.status_code} {r.text}")
+            else:
+                log(f"Bound stage order={order}.")
+        bind(ident_stage, 10)
+        bind(pwd_stage, 20)
+        bind(login_stage, 30)
+
+    # --- LDAP Provider + Application + Outpost ---
+    # Provider: /providers/ldap/
+    ldap_provider = find_by_name(ak, "/providers/ldap/", "TAK LDAP")
+    if not ldap_provider:
+        payload = {
+            "name": "TAK LDAP",
+            "base_dn": "DC=takldap",
+            "bind_flow": flow.get("pk") if flow else None,
+            # cached binding/query flags vary by version; try common names
+            "cached_bind": True,
+            "cached_query": True,
+        }
+        r = ak.post("/providers/ldap/", payload)
+        if r.status_code >= 400:
+            log(f"WARNING: create LDAP provider failed: {r.status_code} {r.text}")
+            ldap_provider = None
+        else:
+            ldap_provider = r.json()
+            log("Created LDAP provider TAK LDAP.")
+    else:
+        log("LDAP provider exists: TAK LDAP")
+
+    # Application: /core/applications/
+    ldap_app = find_by_name(ak, "/core/applications/", "TAK LDAP")
+    if not ldap_app and ldap_provider:
+        r = ak.post("/core/applications/", {
+            "name": "TAK LDAP",
+            "slug": "tak-ldap",
+            "provider": ldap_provider.get("pk") or ldap_provider.get("id"),
+        })
+        if r.status_code >= 400:
+            log(f"WARNING: create LDAP application failed: {r.status_code} {r.text}")
+        else:
+            ldap_app = r.json()
+            log("Created LDAP application.")
+    else:
+        if ldap_app:
+            log("LDAP application exists.")
+
+    # Outpost instance: /outposts/instances/
+    outpost = find_by_name(ak, "/outposts/instances/", "TAK LDAP")
+    if not outpost and ldap_app:
+        # Embedded outpost by default often exists; we can attach provider/app to it,
+        # but here we create a named one as requested.
+        payload = {
+            "name": "TAK LDAP",
+            "type": "ldap",
+            "providers": [ldap_provider.get("pk") or ldap_provider.get("id")] if ldap_provider else [],
+        }
+        r = ak.post("/outposts/instances/", payload)
+        if r.status_code >= 400:
+            log(f"WARNING: create outpost instance failed: {r.status_code} {r.text}")
+        else:
+            outpost = r.json()
+            log("Created outpost instance TAK LDAP.")
+    else:
+        if outpost:
+            log("Outpost instance exists: TAK LDAP")
+
+    # --- TAK Portal proxy provider + app ---
+    # This depends on your desired forward-auth behavior.
+    # Provider: /providers/proxy/
+    proxy_provider = find_by_name(ak, "/providers/proxy/", "TAK Portal Proxy")
+    if not proxy_provider:
+        payload = {
+            "name": "TAK Portal Proxy",
+            "mode": "forward_single",  # common forward-auth mode name (may vary)
+            "external_host": tak_domain,
+            "authorization_flow": None,  # will use default if omitted on some versions
+            "access_token_validity": "14:00:00",
+            "refresh_token_validity": "14:00:00",
+            "intercept_header_auth": True,
+        }
+        r = ak.post("/providers/proxy/", payload)
+        if r.status_code >= 400:
+            log(f"WARNING: create proxy provider failed: {r.status_code} {r.text}")
+            proxy_provider = None
+        else:
+            proxy_provider = r.json()
+            log("Created proxy provider TAK Portal Proxy.")
+    else:
+        log("Proxy provider exists: TAK Portal Proxy")
+
+    tak_app = find_by_name(ak, "/core/applications/", "TAK Portal")
+    if not tak_app and proxy_provider:
+        payload = {
+            "name": "TAK Portal",
+            "slug": "tak-portal",
+            "provider": proxy_provider.get("pk") or proxy_provider.get("id"),
+            # Attempt to point at implicit-consent flow if it exists; otherwise leave null.
+        }
+        # Try to find the default implicit consent flow by slug (common default)
+        implicit = find_by_slug(ak, "/flows/instances/", "default-provider-authorization-implicit-consent")
+        if implicit:
+            payload["authorization_flow"] = implicit.get("pk") or implicit.get("id")
+        r = ak.post("/core/applications/", payload)
+        if r.status_code >= 400:
+            log(f"WARNING: create TAK Portal application failed: {r.status_code} {r.text}")
+        else:
+            tak_app = r.json()
+            log("Created TAK Portal application.")
+    else:
+        if tak_app:
+            log("TAK Portal application exists.")
+
+    # --- adm_takportal user + superuser group + API token ---
+    # Create user
+    r = ak.get("/core/users/", params={"username": "adm_takportal"})
+    must_ok(r, "list users")
+    results = r.json().get("results", [])
+    if results:
+        tak_user = results[0]
+        log("User exists: adm_takportal")
+    else:
+        r = ak.post("/core/users/", {"username": "adm_takportal", "name": "adm_takportal", "is_active": True})
+        if r.status_code >= 400:
+            log(f"WARNING: create user adm_takportal failed: {r.status_code} {r.text}")
+            tak_user = None
+        else:
+            tak_user = r.json()
+            log("Created user adm_takportal")
+
+    if tak_user:
+        uid2 = tak_user.get("pk") or tak_user.get("id")
+        r = ak.post(f"/core/users/{uid2}/set_password/", {"password": tak_pw})
+        if r.status_code >= 400:
+            log(f"WARNING: set_password adm_takportal failed: {r.status_code} {r.text}")
+        else:
+            log("Set password for adm_takportal")
+
+        # Add to authentik Admins (superuser) group
+        r = ak.post(f"/core/groups/{admins['pk']}/add_user/", {"pk": uid2})
+        if r.status_code not in (204, 200):
+            log(f"WARNING: add_user adm_takportal to authentik Admins failed: {r.status_code} {r.text}")
+        else:
+            log("Added adm_takportal to authentik Admins (superuser).")
+
+        # Create non-expiring API token
+        # /core/tokens/
+        token_name = "adm_takportal-api"
+        # See if token exists
+        r = ak.get("/core/tokens/", params={"identifier": token_name})
+        if r.status_code == 200:
+            found = r.json().get("results", [])
+        else:
+            found = []
+        if found:
+            log("API token already exists for adm_takportal (identifier adm_takportal-api).")
+            tak_api_key = None
+        else:
+            r = ak.post("/core/tokens/", {
+                "identifier": token_name,
+                "intent": "api",
+                "user": uid2,
+                "expiring": False,
+            })
+            if r.status_code >= 400:
+                log(f"WARNING: create API token failed: {r.status_code} {r.text}")
+                tak_api_key = None
+            else:
+                tok = r.json()
+                tak_api_key = tok.get("key")  # Usually only shown once.
+                log("Created non-expiring API token for adm_takportal.")
+
+    # Final summary to stdout (not stderr)
     print("")
     print("========== OUTPUTS ==========")
     print(f"adm_ldapservice password: {ldap_pw}")
     print(f"adm_takportal  password: {tak_pw}")
+    # tak_api_key may be None if token existed or API doesn't return it
+    if 'tak_api_key' in locals() and tak_api_key:
+        print(f"adm_takportal API key:   {tak_api_key}")
+    else:
+        print("adm_takportal API key:   (not displayed; token may already exist or API didn't return key)")
     print("=============================")
 
 if __name__ == "__main__":
@@ -511,7 +799,6 @@ PY
 
 main() {
   need_root
-  preflight_environment
   install_deps
   get_inputs
   setup_compose
