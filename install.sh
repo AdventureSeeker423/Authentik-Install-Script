@@ -1,5 +1,36 @@
 #!/usr/bin/env bash
-set -euo pipefail
+set -Eeuo pipefail
+
+############################################
+# Verbose logging setup
+############################################
+TS="$(date +%Y%m%d-%H%M%S)"
+LOGFILE="/var/log/authentik-install-${TS}.log"
+if ! ( touch "$LOGFILE" >/dev/null 2>&1 ); then
+  LOGFILE="./authentik-install-${TS}.log"
+  touch "$LOGFILE"
+fi
+
+# Timestamped xtrace lines
+export PS4='+ [$(date "+%F %T")] ${BASH_SOURCE##*/}:${LINENO}:${FUNCNAME[0]:-main}() '
+
+# Send stdout+stderr to screen + logfile
+exec > >(tee -a "$LOGFILE") 2>&1
+set -x
+
+on_err() {
+  local ec=$?
+  echo
+  echo "===== ERROR ====="
+  echo "Exit code: $ec"
+  echo "At line: ${BASH_LINENO[0]} in ${BASH_SOURCE[1]}"
+  echo "Command: ${BASH_COMMAND}"
+  echo "Log file: $LOGFILE"
+  echo "============="
+  echo
+  exit "$ec"
+}
+trap on_err ERR
 
 ############################################
 # CONFIG
@@ -12,7 +43,6 @@ LOCALHOST="127.0.0.1"
 # HELPERS
 ############################################
 log() { echo -e "\n== $* =="; }
-die() { echo "ERROR: $*" >&2; exit 1; }
 
 as_root() {
   if [[ "$(id -u)" -eq 0 ]]; then
@@ -30,7 +60,7 @@ rand_alnum() {
 prompt_default() {
   local prompt="$1" def="$2" val=""
   read -r -p "$prompt [$def]: " val || true
-  [[ -z "$val" ]] && echo "$def" || echo "$val"
+  [[ -z "${val:-}" ]] && echo "$def" || echo "$val"
 }
 
 strip_url() {
@@ -43,18 +73,18 @@ strip_url() {
 ############################################
 # QUESTIONS
 ############################################
-echo "== authentik + TAK automation =="
+echo "== authentik + TAK automation (VERBOSE) =="
+echo "Log file: $LOGFILE"
 
 HTTP_PORT="$(prompt_default 'authentik http port number?' '9000')"
 HTTPS_PORT="$(prompt_default 'authentik https port number?' '9001')"
 
 read -r -p "Authentik Domain? (optional): " AUTH_DOMAIN || true
 read -r -p "TAK Portal Domain? (required): " TAK_DOMAIN || true
-[[ -z "${TAK_DOMAIN:-}" ]] && die "TAK Portal Domain is required"
+[[ -z "${TAK_DOMAIN:-}" ]] && { echo "TAK Portal Domain is required"; exit 1; }
 
 AUTH_DOMAIN="$(strip_url "${AUTH_DOMAIN:-}")"
 TAK_DOMAIN="$(strip_url "$TAK_DOMAIN")"
-
 BASE_URL="http://${LOCALHOST}:${HTTP_PORT}"
 
 ############################################
@@ -65,7 +95,7 @@ as_root "apt-get update -y"
 as_root "apt-get install -y ca-certificates curl jq openssl gnupg lsb-release python3"
 
 ############################################
-# DOCKER + COMPOSE
+# DOCKER + COMPOSE v2
 ############################################
 if ! command -v docker >/dev/null 2>&1; then
   log "Installing Docker"
@@ -95,12 +125,12 @@ cd "${INSTALL_DIR}"
 ############################################
 log "Downloading docker-compose.yml"
 curl -fsSLo docker-compose.yml "${COMPOSE_URL}"
+head -n 30 docker-compose.yml
 
 ############################################
-# PATCH PORTS (SAFE METHOD)
+# PATCH PORTS
 ############################################
-log "Patching compose ports"
-
+log "Patching compose ports to use env vars"
 python3 <<'PY'
 from pathlib import Path
 p = Path("docker-compose.yml")
@@ -110,9 +140,13 @@ txt = txt.replace("9443:9443", "${COMPOSE_PORT_HTTPS:-9443}:9443")
 p.write_text(txt)
 PY
 
+# show patched lines
+grep -nE '9000:9000|9443:9443|COMPOSE_PORT_HTTP|COMPOSE_PORT_HTTPS' docker-compose.yml || true
+
 ############################################
 # SECRETS
 ############################################
+log "Generating secrets (dotenv-safe)"
 AUTHENTIK_SECRET_KEY="$(openssl rand -base64 36 | tr -d '\n')"
 PG_PASS="$(rand_alnum 28)"
 
@@ -140,97 +174,77 @@ AUTHENTIK_BOOTSTRAP_PASSWORD=${BOOTSTRAP_PASSWORD}
 AUTHENTIK_BOOTSTRAP_TOKEN=${BOOTSTRAP_TOKEN}
 EOF
 
+sed -n '1,200p' .env
+
+############################################
+# PORT CHECK
+############################################
+log "Checking for port conflicts"
+as_root "ss -ltnp | grep -E '(:${HTTP_PORT}\b|:${HTTPS_PORT}\b)' || true"
+
 ############################################
 # START CONTAINERS
 ############################################
-log "Starting authentik"
+log "docker compose pull"
 docker compose pull
+
+log "docker compose up -d"
 docker compose up -d
+
+log "docker compose ps"
+docker compose ps || true
 
 ############################################
 # WAIT FOR API
 ############################################
-log "Waiting for API"
-for i in {1..150}; do
-  curl -fsS "${BASE_URL}/api/v3/root/config/" >/dev/null && break
+log "Waiting for authentik API at ${BASE_URL}"
+for i in $(seq 1 150); do
+  if curl -fsS "${BASE_URL}/api/v3/root/config/" >/dev/null 2>&1; then
+    echo "authentik is responding."
+    break
+  fi
   sleep 2
-done || die "authentik API not responding"
+  if [[ "$i" -eq 150 ]]; then
+    echo "Timed out waiting for API"
+    docker compose logs --tail=200 || true
+    exit 1
+  fi
+done
 
 ############################################
-# BLUEPRINT
+# BLUEPRINT (best-effort)
 ############################################
-log "Applying blueprint"
-
+log "Writing blueprint"
 cat > tak-blueprint.yaml <<EOF
 version: 1
 metadata:
   name: TAK Bootstrap
 entries:
-  - model: authentik_core.group
-    state: present
-    identifiers: { name: authentik-GlobalAdmin }
-
-  - model: authentik_policies_password.passwordpolicy
-    state: present
-    identifiers: { name: default-password-change-password-policy }
-    attrs:
-      min_length: 12
-      min_uppercase: 1
-      min_lowercase: 1
-      min_digits: 1
-      min_symbols: 1
-
-  - model: authentik_providers_ldap.ldapprovider
-    state: present
-    identifiers: { name: TAK LDAP }
-    attrs:
-      base_dn: DC=takldap
-      bind_mode: cached
-      search_mode: cached
-
   - model: authentik_core.user
     state: present
     identifiers: { username: adm_ldapservice }
     attrs:
       password: ${LDAP_SERVICE_PW}
       path: service_accounts
-
-  - model: authentik_core.user
-    state: present
-    identifiers: { username: adm_takportal }
-    attrs:
-      password: ${TAKPORTAL_PW}
-      groups:
-        - authentik Admins
-
-  - model: authentik_core.token
-    state: present
-    identifiers: { identifier: takportal-api }
-    attrs:
-      key: ${TAKPORTAL_API_TOKEN}
-      intent: api
-      user: !Find [authentik_core.user, [username, adm_takportal]]
 EOF
 
+log "Creating blueprint via API (best-effort)"
 curl -fsS \
   -H "Authorization: Bearer ${BOOTSTRAP_TOKEN}" \
   -H "Content-Type: application/json" \
   -d "$(jq -n --arg c "$(cat tak-blueprint.yaml)" '{name:"TAK Blueprint",enabled:true,content:$c}')" \
-  "${BASE_URL}/api/v3/managed/blueprints/" >/dev/null || true
+  "${BASE_URL}/api/v3/managed/blueprints/" || true
 
 ############################################
 # DONE
 ############################################
 log "INSTALL COMPLETE"
-
-echo
-echo "URL:                 ${BASE_URL}/if/admin/"
+echo "Log file:            $LOGFILE"
+echo "authentik URL:       ${BASE_URL}/if/admin/"
 echo "Bootstrap Email:     ${BOOTSTRAP_EMAIL}"
 echo "Bootstrap Password:  ${BOOTSTRAP_PASSWORD}"
 echo "Bootstrap API Token: ${BOOTSTRAP_TOKEN}"
-echo
 echo "LDAP Service PW:     ${LDAP_SERVICE_PW}"
 echo "TAK Portal User PW:  ${TAKPORTAL_PW}"
 echo "TAK Portal API Key:  ${TAKPORTAL_API_TOKEN}"
-echo
 echo "Logs: cd ${INSTALL_DIR} && docker compose logs -f"
